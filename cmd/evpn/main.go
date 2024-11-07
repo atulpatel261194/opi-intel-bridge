@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,8 @@ import (
 	"github.com/opiproject/opi-evpn-bridge/pkg/config"
 	"github.com/opiproject/opi-evpn-bridge/pkg/infradb"
 	"github.com/opiproject/opi-evpn-bridge/pkg/infradb/taskmanager"
+	"github.com/opiproject/opi-evpn-bridge/pkg/ipsec"
+	psec "github.com/opiproject/opi-evpn-bridge/pkg/ipsec/gen/go"
 	"github.com/opiproject/opi-evpn-bridge/pkg/port"
 	"github.com/opiproject/opi-evpn-bridge/pkg/svi"
 	"github.com/opiproject/opi-evpn-bridge/pkg/utils"
@@ -88,6 +91,12 @@ var rootCmd = &cobra.Command{
 			netlink.Initialize()
 		default:
 		}
+
+		// Create GRD tunnel representor configuration during startup
+		if err := createGrdTunnelRep(); err != nil {
+			log.Panicf("Error: %v", err)
+		}
+
 		runGrpcServer(config.GlobalConfig.GRPCPort, config.GlobalConfig.TLSFiles)
 
 	},
@@ -242,10 +251,12 @@ func runGrpcServer(grpcPort uint16, tlsFiles string) {
 	portServer := port.NewServer()
 	vrfServer := vrf.NewServer()
 	sviServer := svi.NewServer()
+	ipsecServer := ipsec.NewServer()
 	pe.RegisterLogicalBridgeServiceServer(s, bridgeServer)
 	pe.RegisterBridgePortServiceServer(s, portServer)
 	pe.RegisterVrfServiceServer(s, vrfServer)
 	pe.RegisterSviServiceServer(s, sviServer)
+	psec.RegisterIPSecServer(s, ipsecServer)
 	pc.RegisterInventoryServiceServer(s, &inventory.Server{})
 
 	reflection.Register(s)
@@ -299,6 +310,42 @@ func createGrdVrf() error {
 	if err != nil {
 		log.Printf("CreateGrdVrf(): Error in creating GRD VRF object %+v\n", err)
 		return err
+	}
+
+	return nil
+}
+
+// CreateGrdTunnelRep creates the Tunnel Representors interfaces for GRD VRF domain
+func createGrdTunnelRep() error {
+	if !config.GlobalConfig.Ipsec.Enabled {
+		return nil
+	}
+
+	if len(config.GlobalConfig.Ipsec.Tunnels) == 0 {
+		return errors.New("createGrdTunnelRep(): Tunnel configuration is missing from configuration file")
+
+	}
+
+	for _, tunCfg := range config.GlobalConfig.Ipsec.Tunnels {
+		tunRep, err := infradb.NewTunRep(tunCfg)
+		if err != nil {
+			return err
+		}
+
+		_, err = infradb.GetTunRep(tunRep.Name)
+		if err != nil {
+			if err != infradb.ErrKeyNotFound {
+				return err
+			}
+		} else {
+			err = fmt.Errorf("createGrdTunnelRep(): Already existing Tunnel Representor with id %v", tunRep.Name)
+			return err
+		}
+
+		err = infradb.CreateTunRep(tunRep)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

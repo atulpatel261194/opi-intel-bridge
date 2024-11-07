@@ -51,6 +51,18 @@ netlink:
       vsi: 0
     - name: "enp0s1f0d2"
       vsi: 1
+ipsec:
+    enabled: true
+    tunnels:
+      - name: "pe2-1"
+        ifid: 101
+        # The IPs below are just examples. Replace them with the real IPs of the system
+        ip: "25.25.25.3/32"
+        remoteip: "26.26.26.4"
+      - name: "pe2-2"
+        ifid: 102
+        ip: "27.27.27.5/32"
+        remoteip: "28.28.28.6"
 loglevel:
   db: INFO
   grpc: INFO
