@@ -1111,16 +1111,7 @@ func Initialize() {
 	time.Sleep(time.Second * 60)
 	// add static rules into the pipeline of representators read from config
 	representors := make(map[string][2]string)
-	/*for k, v := range config.GlobalConfig.P4.Representors {
-		vsi, mac, err := idsOf(v.(string))
-		if err != nil {
-			log.Println("intel-e2000: Error:", err)
-			return
-		}
-		representors[k] = [2]string{vsi, mac}
-	}
-	log.Printf("intel-e2000: REPRESENTORS %+v\n", representors)*/
-	// Add the physical port representors
+
 	// Add the physical port representors
 	for i, port := range config.GlobalConfig.Interfaces.PhyPorts {
 		key := fmt.Sprintf("phy%d_rep", i)
@@ -1164,7 +1155,6 @@ func Initialize() {
 	log.Printf("intel-e2000: REPRESENTORS %+v\n", representors)
 	L3 = L3.L3DecoderInit(representors)
 	Pod = Pod.PodDecoderInit(representors)
-	// decoders = []interface{}{L3, Vxlan, Pod}
 	Vxlan = Vxlan.VxlanDecoderInit(representors)
 	L3entries := L3.StaticAdditions()
 	for _, entry := range L3entries {

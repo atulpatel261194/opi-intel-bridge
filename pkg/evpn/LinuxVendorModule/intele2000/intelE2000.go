@@ -3,7 +3,7 @@
 // Copyright (C) 2023 Nordix Foundation.
 
 // Package intele2000 handles intel e2000 vendor specific tasks
-//nolint: all
+// nolint: all
 package intele2000
 
 import (
@@ -38,6 +38,9 @@ type ModulelvmHandler struct{}
 
 // lvmComp empty interface
 const lvmComp string = "lvm"
+
+// maxRetries Retries for setting rp filter
+const maxRetries int = 5
 
 // run runs the command
 func run(cmd []string, flag bool) (string, int) {
@@ -332,7 +335,7 @@ func handlevrf(objectData *eventbus.ObjectData) {
 func disableRpFilter(iface string) {
 	// Work-around for the observation that sometimes the sysctl -w command did not take effect.
 	rpFilterDisabled := false
-	for i := 0; i < 5; i++ {
+	for i := 0; i < maxRetries; i++ {
 		rpDisable := fmt.Sprintf("net.ipv4.conf.%s.rp_filter=0", iface)
 		output, errCode := run([]string{"sysctl", "-w", rpDisable}, false)
 		if errCode != 0 {
