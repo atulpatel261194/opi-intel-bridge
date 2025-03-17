@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2022-2023 Intel Corporation, or its subsidiaries.
 // Copyright (C) 2023 Nordix Foundation.
-//
-//nolint:all
+
 package p4translation
 
 import (
@@ -18,6 +17,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/golang/protobuf/proto"
+	"github.com/openconfig/gnmi/proto/gnmi"
+	"github.com/opiproject/opi-evpn-bridge/pkg/config"
 	"github.com/opiproject/opi-evpn-bridge/pkg/infradb"
 	netlink_polling "github.com/opiproject/opi-evpn-bridge/pkg/netlink"
 	"github.com/opiproject/opi-evpn-bridge/pkg/utils"
@@ -54,7 +56,7 @@ var Vlan = struct {
 }
 var trueStr = "TRUE"
 var grdStr = "GRD"
-var intele2000Str = "intel-e2000"
+var intele2000Str = "intel_e2000"
 
 // PortID structure of type phy port
 var PortID = struct {
@@ -68,11 +70,12 @@ var PortID = struct {
 
 // EntryType structure of entry type
 var EntryType = struct {
-	BP, l3NH, l2Nh, trieIn uint32
+	BP, l3NH, l2Nh, TUN, trieIn uint32
 }{
 	BP:   1,
 	l3NH: 2,
 	l2Nh: 3,
+	TUN:  4,
 }
 
 // ModPointer structure of  mod ptr definitions
@@ -102,12 +105,12 @@ var EcmpIndex = struct {
 }
 
 // ptrPool initialized variable
-var ptrPool, _ = utils.IDPoolInit("mod_ptr", ModPointer.ptrMinRange, ModPointer.ptrMaxRange)
+var ptrPool,_ = utils.IDPoolInit("mod_ptr", ModPointer.ptrMinRange, ModPointer.ptrMaxRange)
 
 // trieIndexPool initialized variable
-var trieIndexPool, _ = utils.IDPoolInit("trie_index", TrieIndex.triIdxMinRange, TrieIndex.triIdxMaxRange)
+var trieIndexPool,_ = utils.IDPoolInit("trie_index", TrieIndex.triIdxMinRange, TrieIndex.triIdxMaxRange)
 
-var ecmpIndexPool, _ = utils.IDPoolInit("ecmp", EcmpIndex.ecmpIdxMinRange, EcmpIndex.ecmpIdxMaxRange)
+var ecmpIndexPool,_ = utils.IDPoolInit("ecmp", EcmpIndex.ecmpIdxMinRange, EcmpIndex.ecmpIdxMaxRange)
 
 // Table of type string
 type Table string
@@ -191,6 +194,7 @@ const (
 	//                               send_p2p(dport, q_id)
 	//                               sendp2p_push_mac(mod_ptr, dport, q_id)
 	//                               send_p2p_push_outermac_vxlan_innermac(mod_ptr, vport, q_id)
+	//								 set_crypto_ip(mod_ptr, saidx, port)
 	//                            )
 
 	// l3EcmpSel evpn p4 table name
@@ -213,6 +217,7 @@ const (
 	//                           )
 	//                           Actions(
 	//                               fwd_to_port(port)
+	//								 set_crypto_ip(mod_ptr, saidx, port)
 	//
 
 	// phyInIP  evpn p4 table name
@@ -243,7 +248,7 @@ const (
 	//                               da
 	//                           )
 	//                           Actions(
-	//                               pop_vxlan_set_vrf_id(mod_ptr, tcam_prefix, vport, vrf),
+	//                               pop_vxlan_set_vrf_id(mod_ptr, tcam_prefix, vrf),
 	//                           )
 
 	// phyInVxlanL2  evpn p4 table name
@@ -321,7 +326,7 @@ const (
 	//                           da                          // Exact
 	//                       }
 	//                       Actions(
-	//                           pop_vlan_set_vrf_id(tcam_prefix, mod_ptr, vport, vrf)
+	//                           pop_vlan_set_vrf_id(tcam_prefix, mod_ptr, vrf)
 	//                       )
 
 	// portMuxIn  evpn p4 table name
@@ -375,7 +380,7 @@ const (
 	//                       )
 
 	// l2Nh  evpn p4 table name
-	l2Nh = "evpn_gw_control.l2_nexthop_table"
+	l2NhRx = "evpn_gw_control.l2_nexthop_table_rx"
 	//                       Key {
 	//                           neighbor                    // Exact
 	//                           bit32_zeros                 // Exact
@@ -387,7 +392,7 @@ const (
 	//                           fwd_to_port(port)
 	//                           push_outermac_vxlan(mod_ptr, vport)
 	//                       )
-
+	l2NhTx = "evpn_gw_control.l2_nexthop_table_tx"
 	// tcamEntries  evpn p4 table name
 	tcamEntries = "evpn_gw_control.ecmp_lpm_root_lut1"
 
@@ -409,6 +414,44 @@ const (
 	//                           None(ipv4_table_lpm_root2)
 	//
 
+	ipsecSA = "tdi.fixed.ipsec_offload.ipsec_offload.sad.sad_entry.ipsec-sa-config"
+	//			 Key {
+	//			     offload_id,
+	//			     direction,
+	//			}
+	//			Actions(
+	//				add(key_len,key,spi,req_id,encryption_algorithm, sa_lifetime_soft,sa_lifetime_hard)
+	//			)
+
+	ipsecRxSA = "CXPControl.ipsec_rx_sa_classification_table"
+	//			Key {
+	//			    src_ip,                 # Exact
+	//			    dst_ip,                 # Exact
+	//			    spi,                    # Exact
+	//			    }
+	//			Actions(
+	//				ipsec_decrypt(sa)
+	//			)
+
+	phyInIpIp = "evpn_gw_control.phy_ingress_ip_ip_table" // PHY ingress table - IP_IP traffic
+	//			TableKeys(
+	//				crypto_status,               # Exact
+	//				dst_ip,                      # Exact
+	//			)
+	//			Actions(
+	//				pop_outer_ip_set_vrf_id(mod_ptr,tcam_prefix, vrf)
+	//			)
+
+	phyInIPSecVxlan = "evpn_gw_control.phy_ingress_ip_vxlan_table"
+	//                       TableKeys(
+	//                           crypto_status,               # Exact
+	//                               dst_ip,                      # Exact
+	//                               vni,                         # Exact
+	//                               da                           # Exact
+	//                           )
+	//                           Actions(
+	//                               pop_omac_ip_vxlan_set_vrf_id(mod_ptr, tcam_prefix, vrf),
+	//                           )
 )
 
 // ModTable string var of mod table
@@ -499,6 +542,40 @@ const (
 	//			Action(
 	//                           omac_vxlan_push(outer_smac_addr, outer_dmac_addr, src_addr, dst_addr, dst_port, vni)
 	//                       )
+
+	popVlanPushIPSec = "evpn_gw_control.pop_vlan_push_outer_mac_ip_mod_table"
+	//			src_action="tagged_vport_ingress_table.pop_vlan_push_outer_mac_ip()"
+	//			 Action(
+	//				pop_vlan_push_outer_mac_ip_mod(src_addr, dst_addr, smac, dmac)
+	//			)
+
+	pushVxlanIPSec = "evpn_gw_control.omac_crypto_vxlan_imac_push_mod_table"
+	//                       src_action="omac_crypto_vxlan_imac_push"
+	//                       Actions(
+	//                           omac_vxlan_imac_push(outer_smac_addr,
+	//                                                outer_dmac_addr,
+	//                                                src_addr_2,
+	//                                                dst_addr_2,
+	//                                                src_addr,
+	//                                                dst_addr,
+	//                                                dst_port,
+	//                                                vni,
+	//                                                inner_smac_addr,
+	//                                                inner_dmac_addr)
+
+	pushIPSec = "evpn_gw_control.crypto_tunnel_ip_mod_table"
+	//						src_action="set_crypto_ip"
+	//						Actions(
+	//							crypto_tunnel_ip_mod(outer_smac_addr,
+	//												 outer_dmac_addr,
+	//												 src_addr,
+	//												 dst_addr)
+
+	PopOuterIP2 = "evpn_gw_control.outer_ip2_pop_mod_table"
+	//						src_action="phy_ingress_ip_vxlan_table.pop_outer_ip_vxlan_miss()"
+	//						Action(
+	//							outer_ip2_pop()
+	//						)
 
 )
 
@@ -620,7 +697,7 @@ type PhyPort struct {
 // PhyPortInit initializes the phy port
 func (p PhyPort) PhyPortInit(id int, vsi string, mac string) PhyPort {
 	p.id = id
-	val, err := strconv.ParseUint(vsi, 10, 16)
+	val, err := strconv.ParseInt(vsi, 10, 32)
 	if err != nil {
 		panic(err)
 	}
@@ -634,7 +711,8 @@ func (p PhyPort) PhyPortInit(id int, vsi string, mac string) PhyPort {
 func _p4NexthopID(nh netlink_polling.NexthopStruct, direction int) int {
 	nhID := nh.ID << 1
 
-	if direction == Direction.Rx && (nh.NhType == netlink_polling.PHY || nh.NhType == netlink_polling.VXLAN) {
+	if direction == Direction.Rx && (nh.Metadata["direction"].(int) == netlink_polling.TX) { //|| (direction == Direction.Rx && (nh.Metadata["direction"].(int) == netlink_polling.RXTX)) {
+		//if direction == Direction.Rx && (nh.Metadata["direction"].(int) == netlink_polling.TX) {
 		nhID++
 	}
 
@@ -655,9 +733,9 @@ func (e *EcmpDispatcher) _p4NexthopID(direction int) int {
 // _p2pQid get the qid for p2p port
 func _p2pQid(pID int) int {
 	if pID == PortID.PHY0 {
-		return 0x87
+		return 0
 	} else if pID == PortID.PHY1 {
-		return 0x8d
+		return 0
 	}
 
 	return 0
@@ -704,7 +782,12 @@ func (e *EcmpDispatcher) getecmpnh(nexthop []*netlink_polling.NexthopStruct) {
 
 		e.Nexthop[i].ID = nh.ID
 
-		if nh.Metadata == nil {
+		if nh.Metadata != nil {
+			if e.Nexthop[i].Metadata == nil {
+				e.Nexthop[i].Metadata = make(map[interface{}]interface{})
+			}
+			e.Nexthop[i].Metadata = nh.Metadata
+		} else {
 			log.Printf("Dcgw Ecmp : nexthop[%d].Metadata is nil\n", i)
 			continue
 		}
@@ -755,7 +838,7 @@ func (e *EcmpDispatcher) checkdir() bool {
 // EcmpDispatcherInit function initializes the ecmp objects
 func (e *EcmpDispatcher) EcmpDispatcherInit(nexthop []*netlink_polling.NexthopStruct, vrf *infradb.Vrf) bool {
 	e.Nexthop = make([]*netlink_polling.NexthopStruct, len(nexthop))
-	for i := range nexthop {
+	for i, _ := range nexthop {
 		e.Nexthop[i] = &netlink_polling.NexthopStruct{}
 		e.Nexthop[i].ParseNexthop(vrf, netlink_polling.RouteCmdInfo{})
 		e.Nexthop[i].NhType = netlink_polling.ECMP
@@ -779,7 +862,7 @@ type GrpcPairPort struct {
 
 // GrpcPairPortInit get the vsi+16
 func (g GrpcPairPort) GrpcPairPortInit(vsi string, mac string) GrpcPairPort {
-	val, err := strconv.ParseUint(vsi, 10, 16)
+	val, err := strconv.ParseInt(vsi, 10, 32)
 	if err != nil {
 		panic(err)
 	}
@@ -873,7 +956,7 @@ func (l L3Decoder) _getGrpcInfo(representors map[string][2]string) []GrpcPairPor
 
 // getVrfID get the vrf id from vni
 func (l L3Decoder) getVrfID(route netlink_polling.RouteStruct) uint32 {
-	if route.Vrf.Spec.Vni == nil {
+	if path.Base(route.Vrf.Name) == "GRD" {
 		return 0
 	}
 
@@ -932,7 +1015,10 @@ func (l L3Decoder) _l3HostRoute(route netlink_polling.RouteStruct, delete string
 			})
 		}
 	}
-	if path.Base(route.Vrf.Name) == grdStr && route.Nexthops[0].NhType == netlink_polling.PHY {
+	//if path.Base(route.Vrf.Name) == grdStr && route.Nexthops[0].NhType == netlink_polling.PHY {
+	//AP:IPSEC
+	if path.Base(route.Vrf.Name) == grdStr && (route.Nexthops[0].NhType == netlink_polling.PHY || route.Nexthops[0].NhType == netlink_polling.TUN) {
+		//end AP:IPSEC
 		if delete == trueStr {
 			entries = append(entries, p4client.TableEntry{
 				Tablename: l3P2PRtHost,
@@ -1029,7 +1115,10 @@ func (l L3Decoder) _l3Route(route netlink_polling.RouteStruct, delete string, ec
 			})
 		}
 	}
-	if path.Base(route.Vrf.Name) == grdStr && route.Nexthops[0].NhType == netlink_polling.PHY {
+	//if path.Base(route.Vrf.Name) == grdStr && route.Nexthops[0].NhType == netlink_polling.PHY {
+	//AP:IPSEC
+	if path.Base(route.Vrf.Name) == grdStr && (route.Nexthops[0].NhType == netlink_polling.PHY || route.Nexthops[0].NhType == netlink_polling.TUN) {
+		//end AP:IPSEC
 		tidx := trieIndexPool.GetID(TcamPrefix.P2P)
 		if delete == trueStr {
 			entries = append(entries, p4client.TableEntry{
@@ -1140,6 +1229,7 @@ func (l L3Decoder) translateAddedRoute(route netlink_polling.RouteStruct) []inte
 			return entries
 		}
 		ecmp.id, refCount = ecmpIndexPool.GetIDWithRef(ecmp.key, route.Key)
+		//log.Printf("ecmp.id:%v, refCount:%v ", ecmp.id, refCount)
 		if refCount == 1 {
 			ecmp.runWebsterAlg()
 			entries = ecmp.addEcmpDispatcher(entries)
@@ -1167,10 +1257,13 @@ func (l L3Decoder) translateDeletedRoute(route netlink_polling.RouteStruct) []in
 		if !ecmp.EcmpDispatcherInit(route.Nexthops, route.Vrf) {
 			return entries
 		}
+		//ecmp.id, refCount = ecmpIndexPool.GetID(ecmp.key, route.Key)
 		ecmp.id, refCount = ecmpIndexPool.ReleaseIDWithRef(ecmp.key, route.Key)
+		//log.Printf("ecmp.id:%v, refCount:%v ", ecmp.id, refCount)
 		if refCount == 0 {
 			ecmp.runWebsterAlg()
 			entries = ecmp.delEcmpDispatcher(entries)
+
 		}
 		route.Nexthops = []*netlink_polling.NexthopStruct{}
 		route.Nexthops = ecmp.Nexthop
@@ -1187,11 +1280,11 @@ func (l L3Decoder) translateDeletedRoute(route netlink_polling.RouteStruct) []in
 //
 //nolint:funlen
 func (l L3Decoder) translateAddedNexthop(nexthop netlink_polling.NexthopStruct) []interface{} {
-	if nexthop.NhType == netlink_polling.VXLAN {
+	if nexthop.NhType == netlink_polling.VXLAN || nexthop.NhType == netlink_polling.TUN || nexthop.NhType == netlink_polling.VXLAN_TUN {
 		var entries []interface{}
 		return entries
 	}
-	key := fmt.Sprintf("%d-%s-%s-%d-%v", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Local)
+	key := fmt.Sprintf("%d-%s-%s-%d-%s-%t-%d-%d", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Prefsrc, nexthop.Key.Local, nexthop.Key.Weight, nexthop.Key.NhType)
 	var modPtr = ptrPool.GetID(key)
 	nhID := _p4NexthopID(nexthop, Direction.Tx)
 
@@ -1324,7 +1417,7 @@ func (l L3Decoder) translateAddedNexthop(nexthop netlink_polling.NexthopStruct) 
 				},
 				Action: p4client.Action{
 					ActionName: "evpn_gw_control.update_smac_dmac_vlan",
-					Params:     []interface{}{smac, dmac, 0, 1, uint16(vlanID)},
+					Params:     []interface{}{smac, dmac,uint16(0), uint16(1), uint16(vlanID)},
 				},
 			},
 				p4client.TableEntry{
@@ -1411,12 +1504,13 @@ func (l L3Decoder) translateAddedNexthop(nexthop netlink_polling.NexthopStruct) 
 //
 //nolint:funlen
 func (l L3Decoder) translateDeletedNexthop(nexthop netlink_polling.NexthopStruct) []interface{} {
-	if nexthop.NhType == netlink_polling.VXLAN {
+	if nexthop.NhType == netlink_polling.VXLAN || nexthop.NhType == netlink_polling.TUN || nexthop.NhType == netlink_polling.VXLAN_TUN {
 		var entries []interface{}
 		return entries
 	}
-	key := fmt.Sprintf("%d-%s-%s-%d-%v", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Local)
-	var modPtr = ptrPool.ReleaseID(key)
+	key := fmt.Sprintf("%d-%s-%s-%d-%s-%t-%d-%d", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Prefsrc, nexthop.Key.Local, nexthop.Key.Weight, nexthop.Key.NhType)
+	//var modPtr = ptrPool.GetID(key)
+	var modPtr = ptrPool.ReleaseID(key) // AP:fix1802
 	nhID := _p4NexthopID(nexthop, Direction.Tx)
 	var entries = make([]interface{}, 0)
 	switch nexthop.NhType {
@@ -1581,12 +1675,12 @@ func (l L3Decoder) StaticAdditions() []interface{} {
 		},
 		Action: p4client.Action{
 			ActionName: "evpn_gw_control.pop_vlan_set_vrfid",
-			Params:     []interface{}{ModPointer.ignorePtr, uint32(0), tcamPrefix, uint32(0)},
+			Params:     []interface{}{ModPointer.ignorePtr, tcamPrefix, uint32(0)},
 		},
 	},
 	)
 	for _, port := range l._grpcPorts {
-		var peerVsi, err = strconv.ParseUint(port.peer["vsi"], 10, 16)
+		var peerVsi, err = strconv.ParseInt(port.peer["vsi"], 10, 64)
 		if err != nil {
 			panic(err)
 		}
@@ -1788,6 +1882,642 @@ func (l L3Decoder) StaticDeletions() []interface{} {
 	return entries
 }
 
+type IPSecDecoder struct {
+	_tun_mux_vsi       int
+	_tun_mux_mac       string
+	_phy_portid_by_mac map[string]int
+	// TODO add mactoPort
+}
+
+func (IPSec IPSecDecoder) IPSecDecoderInit(representors map[string][2]string) IPSecDecoder {
+	var muxVsi, err = strconv.ParseInt(representors["tunnel_mux"][0], 10, 32)
+	if err != nil {
+		panic(err)
+	}
+	portid_map := make(map[string]int, 0)
+	/*for k, v := range representors {
+		if k == "phy0_rep" || k == "phy1_rep" {
+			portid_map[v[1]] = v[0]
+		}
+	}*/
+
+	for _, port := range config.GlobalConfig.Interfaces.PhyPorts {
+		_, mac, err := idsOf(port.Rep)
+		if err != nil {
+			log.Printf("Error getting ids for port %s: %v", port.Rep, err)
+			continue
+		}
+		portid_map[mac] = port.Vsi
+	}
+
+	log.Println("In IPSec: portid_map ", portid_map)
+	return IPSecDecoder{
+		_tun_mux_vsi:       int(muxVsi),
+		_tun_mux_mac:       representors["tunnel_mux"][1],
+		_phy_portid_by_mac: portid_map,
+	}
+}
+
+func (IPSec IPSecDecoder) translateAddedTun(tun *infradb.TunRep) []interface{} {
+	var entries = make([]interface{}, 0)
+	if tun.Spec.DestMac == "" || tun.Spec.SaIdx == nil {
+		return entries
+	}
+
+	key := fmt.Sprintf("%d-%d",EntryType.TUN, tun.Spec.IfID)
+	var mod_ptr = ptrPool.GetID(key) //TODO tun.ke
+	//log.Printf("key:%v , mod_ptr :%v  tun.Spec.SaIdx: %v , tun: %v  ", key, mod_ptr, tun.Spec.SaIdx, tun)
+	var smac, _ = net.ParseMAC(tun.Spec.SrcMac)
+	var dmac, _ = net.ParseMAC(tun.Spec.DestMac)
+	var sIP, dIP net.IP
+	if tun.Spec.SrcIP == nil {
+		sIP = net.IP("0.0.0.0")
+	} else {
+		sIP = *tun.Spec.SrcIP
+	}
+	if tun.Spec.DstIP == nil {
+		dIP = net.IP("0.0.0.0")
+	} else {
+		dIP = *tun.Spec.DstIP
+	}
+	var port_id int
+	if tun.Spec.SrcMac != "" {
+		//var err error
+		//port_id, err = strconv.ParseInt(IPSec._phy_portid_by_mac[tun.Spec.SrcMac], 10, 32)
+		_, ok := IPSec._phy_portid_by_mac[tun.Spec.SrcMac]
+		if ok {
+			port_id = IPSec._phy_portid_by_mac[tun.Spec.SrcMac]
+		}
+		/*if err != nil {
+			panic(err)
+		}*/
+	} else {
+		port_id = 0
+	}
+	//log.Printf("IPSec._tun_mux_vsi: %v, tun.Spec.IfID: %v", IPSec._tun_mux_vsi, tun.Spec.IfID)
+	entries = append(entries, p4client.TableEntry{
+		Tablename: popVlanPushIPSec,
+		TableField: p4client.TableField{
+			FieldValue: map[string][2]interface{}{
+				"meta.common.mod_blob_ptr": {mod_ptr, "exact"},
+			},
+			Priority: int32(0),
+		},
+		Action: p4client.Action{
+			ActionName: "evpn_gw_control.pop_vlan_push_outer_mac_ip_mod",
+			Params:     []interface{}{sIP, dIP, smac, dmac}, //TODO
+		},
+	},
+		p4client.TableEntry{
+			Tablename: podInIPTrunk,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"vsi": {uint32(IPSec._tun_mux_vsi), "exact"},
+					"vid": {uint32(tun.Spec.IfID), "exact"},
+				},
+				Priority: int32(0),
+			},
+			Action: p4client.Action{
+				ActionName: "evpn_gw_control.pop_vlan_push_outer_mac_ip",
+				Params:     []interface{}{mod_ptr, uint32(port_id), *tun.Spec.SaIdx}, //TODO
+			},
+		})
+	return entries
+}
+
+func (IPSec IPSecDecoder) translateDeletedTun(tun *infradb.TunRep) []interface{} {
+	var entries = make([]interface{}, 0)
+	if tun.Spec.DestMac == "" || tun.Spec.SaIdx == nil {
+		return entries
+	}
+	key := fmt.Sprintf("%d-%d", EntryType.TUN,tun.Spec.IfID)
+	//var mod_ptr = ptrPool.GetID(key) //TODO tun.key
+	var mod_ptr = ptrPool.ReleaseID(key) //TODO tun.key
+	entries = append(entries, p4client.TableEntry{
+		Tablename: popVlanPushIPSec,
+		TableField: p4client.TableField{
+			FieldValue: map[string][2]interface{}{
+				"meta.common.mod_blob_ptr": {mod_ptr, "exact"},
+			},
+			Priority: int32(0),
+		},
+	},
+		p4client.TableEntry{
+			Tablename: podInIPTrunk,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"vsi": {uint32(IPSec._tun_mux_vsi), "exact"},
+					"vid": {uint32(tun.Spec.IfID), "exact"},
+				},
+				Priority: int32(0),
+			},
+		})
+	return entries
+}
+
+func (IPSec IPSecDecoder) translateAddedSA(sa *infradb.Sa) ([]interface{}, *gnmi.TypedValue) {
+	var entries = make([]interface{}, 0)
+	var mod_ptr = ModPointer.ignorePtr
+	vrf, _ := infradb.GetVrf(sa.Vrf)
+	var tcam_prefix int
+	var vni uint32
+	if vrf.Spec.Vni == nil {
+		vni = 0
+		tcam_prefix, _ = _getTcamPrefix(vni, Direction.Rx)
+	} else {
+		vni = *vrf.Spec.Vni
+		tcam_prefix, _ = _getTcamPrefix(vni, Direction.Rx)
+	}
+	//tcam_prefix := 1
+	var enc_alg int
+	if sa.Spec.EncAlg == infradb.AES_GCM_16 {
+		enc_alg = 0
+	} else if sa.Spec.EncAlg == infradb.NULL_AUTH_AES_GMAC {
+		enc_alg = 1
+	} else {
+		return entries, &gnmi.TypedValue{}
+	}
+	log.Printf("Intel2000: ENC Alg is %v\n", enc_alg)
+	//var key_len = len(sa.Spec.EncKey)
+	//var enc_key = sa.Spec.EncKey // TODO f"0x{sa.enc_key.hex()}"
+	parts := make([]string, len(sa.Spec.EncKey))
+	for i, b := range sa.Spec.EncKey {
+		parts[i] = fmt.Sprintf("%02x", b)
+	}
+	colonSeparatedString := strings.Join(parts, ":")
+	log.Printf("In Sa: sa.Spec.Enc is: %v, parts is: %v, colonSeparatedString is : %v, len(parts) is: %v sa index is : %v\n", sa.Spec.EncKey, parts, colonSeparatedString, len(parts), *sa.Index)
+	ipsecrule := &IPsecSADBConfig{
+		OffloadId: *proto.Uint32(*sa.Index), //*sa.Index,
+		Direction: *proto.Bool(false),
+		ReqId:     *proto.Uint64(2),
+		Spi:       *proto.Uint32(*sa.Spec.Spi), //*sa.Spec.Spi,
+		ExtSeqNum: *proto.Bool(sa.Spec.Esn),
+		//AntiReplayWindowSize: *proto.Uint32(sa.Spec.ReplayWindow),
+		//ProtocolParameters:   IPsecProtocolParams(sa.Spec.Protocol),
+		//Mode:                 IPsecMode(sa.Spec.Mode),
+		EspPayload: &IPsecEspSa{
+			Encryption: &IPsecEncryption{
+				EncryptionAlgorithm: *proto.Uint32(uint32(enc_alg)),
+				//Key:                 *proto.String("33:65:6b:12:d7:9f:56:63:0b:59:a3:9f:8b:03:d2:c1:b8:51:98:e8:04:be:53:7f:00:40:a6:11:8d:02:16:30:53:cf:7e:09"),
+				Key:    *proto.String(colonSeparatedString),
+				KeyLen: *proto.Uint32(uint32(len(parts))),
+			},
+		},
+		/*SaHardLifetime: &IPsecSaHardLifetime{
+			Value: &IPsecSaHardLifetime_Bytes{
+				Bytes: *proto.Uint64(2000000000),
+			},
+		},
+		SaSoftLifetime: &IPsecSaSoftLifetime{
+			Value: &IPsecSaSoftLifetime_Bytes{
+				Bytes: *proto.Uint64(1000000000),
+			},
+		},*/
+	}
+
+	if sa.Spec.Inbound {
+		ipsecrule.Direction = true
+		entries = append(entries, p4client.TableEntry{
+			Tablename: ipsecRxSA,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"src_ip":       {*sa.Spec.SrcIP, "exact"},
+					"dst_ip":       {*sa.Spec.DstIP, "exact"},
+					"hdrs.esp.spi": {*sa.Spec.Spi, "exact"},
+				},
+				Priority: int32(0),
+			},
+			Action: p4client.Action{
+				ActionName: "CXPControl.ipsec_decrypt",
+				Params:     []interface{}{uint32(*sa.Index)}, //TODO
+			},
+		},
+			p4client.TableEntry{
+				Tablename: phyInIpIp,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"meta.common.crypto_status": {uint32(0), "exact"},
+						"meta.common.saidx":         {uint32(*sa.Index), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.pop_outer_ip_set_vrf_id",
+					Params:     []interface{}{mod_ptr, uint32(tcam_prefix), vni}, //TODO
+				},
+			})
+	} else {
+		ipsecrule.Direction = *proto.Bool(false)
+	}
+	log.Printf("In Sa ipsecrule is : %+v\n", ipsecrule)
+	textMarshaler := proto.TextMarshaler{}
+	textData := textMarshaler.Text(ipsecrule)
+
+	typedValue := &gnmi.TypedValue{
+		Value: &gnmi.TypedValue_ProtoBytes{
+			ProtoBytes: []byte(textData),
+		},
+	}
+	log.Printf("typedvalue is :%x\n", typedValue)
+	return entries, typedValue
+}
+
+func (IPSec IPSecDecoder) translateDeletedSA(sa *infradb.Sa) []interface{} {
+	var entries = make([]interface{}, 0)
+
+	if sa.Spec.Inbound {
+		entries = append(entries, p4client.TableEntry{
+			Tablename: ipsecSA,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"offload_id": {*sa.Index, "exact"},
+					"direction":  {uint32(1), "exact"},
+				},
+				Priority: int32(0),
+			},
+		},
+			p4client.TableEntry{
+				Tablename: ipsecRxSA,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"src_ip":       {*sa.Spec.SrcIP, "exact"},
+						"dst_ip":       {*sa.Spec.DstIP, "exact"},
+						"hdrs.esp.spi": {*sa.Spec.Spi, "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+			p4client.TableEntry{
+				Tablename: phyInIpIp,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"meta.common.crypto_status": {uint32(0), "exact"},
+						"meta.common.saidx":         {*sa.Index, "exact"},
+					},
+					Priority: int32(0),
+				},
+			})
+	} else {
+		entries = append(entries, p4client.TableEntry{
+			Tablename: ipsecSA,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"offload_id": {*sa.Index, "exact"},
+					"direction":  {uint32(0), "exact"},
+				},
+				Priority: int32(0),
+			},
+		})
+	}
+	return entries
+}
+
+func (IPSec IPSecDecoder) translateAddedVrf(vrf *infradb.Vrf) []interface{} {
+	var entries = make([]interface{}, 0)
+	if vrf.Spec.Vni == nil {
+		return entries
+	}
+	var mod_ptr = ModPointer.ignorePtr
+	var tcam_prefix, _ = _getTcamPrefix(*vrf.Metadata.RoutingTable[0], Direction.Rx)
+
+	var detail map[string]interface{}
+	var Rmac net.HardwareAddr
+	for _, com := range vrf.Status.Components {
+		if com.Name == "frr" {
+			err := json.Unmarshal([]byte(com.Details), &detail)
+			if err != nil {
+				log.Println("intel-e2000: Error: ", err)
+			}
+			rmac, found := detail["rmac"].(string)
+			if !found {
+				log.Println("intel-e2000: Key 'rmac' not found")
+				break
+			}
+			Rmac, err = net.ParseMAC(rmac)
+			if err != nil {
+				log.Println("intel-e2000: Error parsing MAC address:", err)
+			}
+		}
+	}
+	if reflect.ValueOf(Rmac).IsZero() {
+		log.Println("intel-e2000: Rmac not found for Vtep :", vrf.Spec.VtepIP.IP)
+
+		return entries
+	}
+
+	entries = append(entries, p4client.TableEntry{
+		Tablename: phyInIPSecVxlan,
+		TableField: p4client.TableField{
+			FieldValue: map[string][2]interface{}{
+				"meta.common.crypto_status": {uint32(0), "exact"},
+				"dst_ip":                    {vrf.Spec.VtepIP.IP, "exact"},
+				"vni":                       {*vrf.Spec.Vni, "exact"},
+				"da":                        {Rmac, "exact"},
+			},
+			Priority: int32(0),
+		},
+		Action: p4client.Action{
+			ActionName: "evpn_gw_control.pop_omac_ip_vxlan_set_vrf_id",
+			//Params:     []interface{}{mod_ptr, uint32(tcam_prefix), uint32(*vrf.Spec.Vni)}, //TODO
+			//AP:IPSEC fix
+			Params: []interface{}{mod_ptr, uint32(tcam_prefix), *vrf.Metadata.RoutingTable[0]}, //TODO
+
+		},
+	})
+	return entries
+}
+
+func (IPSec IPSecDecoder) translateDeletedVrf(vrf *infradb.Vrf) []interface{} {
+	var entries = make([]interface{}, 0)
+	if vrf.Spec.Vni == nil {
+		return entries
+	}
+	var detail map[string]interface{}
+	var Rmac net.HardwareAddr
+	for _, com := range vrf.Status.Components {
+		if com.Name == "frr" {
+			err := json.Unmarshal([]byte(com.Details), &detail)
+			if err != nil {
+				log.Println("intel-e2000: Error: ", err)
+			}
+			rmac, found := detail["rmac"].(string)
+			if !found {
+				log.Println("intel-e2000: Key 'rmac' not found")
+				break
+			}
+			Rmac, err = net.ParseMAC(rmac)
+			if err != nil {
+				log.Println("intel-e2000: Error parsing MAC address:", err)
+			}
+		}
+	}
+	if reflect.ValueOf(Rmac).IsZero() {
+		log.Println("intel-e2000: Rmac not found for Vtep :", vrf.Spec.VtepIP.IP)
+
+		return entries
+	}
+	entries = append(entries, p4client.TableEntry{
+		Tablename: phyInIPSecVxlan,
+		TableField: p4client.TableField{
+			FieldValue: map[string][2]interface{}{
+				"meta.common.crypto_status": {uint32(0), "exact"},
+				"dst_ip":                    {vrf.Spec.VtepIP.IP, "exact"},
+				"vni":                       {*vrf.Spec.Vni, "exact"},
+				"da":                        {Rmac, "exact"},
+			},
+			Priority: int32(0),
+		},
+	})
+	return entries
+}
+
+func (IPSec IPSecDecoder) translateAddedNexthop(nexthop netlink_polling.NexthopStruct) []interface{} {
+	var entries = make([]interface{}, 0)
+	if nexthop.NhType != netlink_polling.TUN && nexthop.NhType != netlink_polling.VXLAN_TUN {
+		return entries
+	}
+
+	key := fmt.Sprintf("%d-%s-%s-%d-%s-%t-%d-%d", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Prefsrc, nexthop.Key.Local, nexthop.Key.Weight, nexthop.Key.NhType)
+	// log.Println("Nexthop: %v, nexthop key %v", nexthop, key)
+
+	var mod_ptr = ptrPool.GetID(key)
+	// AP: IPSEC fix
+	// var mod_ptr= ptrPool.GetID(EntryType.l3NH, nexthop.Key)
+	var vport = nexthop.Metadata["egress_vport"].(int)
+	var phySmac, _ = net.ParseMAC(nexthop.Metadata["phy_smac"].(string))
+	var phyDmac, _ = net.ParseMAC(nexthop.Metadata["phy_dmac"].(string))
+
+	var localTepIP = net.ParseIP(nexthop.Metadata["local_tep_ip"].(string))
+	var remoteTepIP = net.ParseIP(nexthop.Metadata["remote_tep_ip"].(string))
+	if nexthop.NhType == netlink_polling.TUN {
+		entries = append(entries, p4client.TableEntry{
+			Tablename: pushIPSec,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"meta.common.mod_blob_ptr": {mod_ptr, "exact"},
+				},
+				Priority: int32(0),
+			},
+			Action: p4client.Action{
+				ActionName: "evpn_gw_control.crypto_tunnel_ip_mod",
+				Params:     []interface{}{phySmac, phyDmac, localTepIP, remoteTepIP}, //TODO
+			},
+		},
+			p4client.TableEntry{
+				Tablename: l3NhTx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Tx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.set_crypto_ip",
+					Params:     []interface{}{mod_ptr, uint32(nexthop.Metadata["sa_idx"].(uint32)), uint32(vport)}, //TODO
+				},
+			},
+			p4client.TableEntry{
+				Tablename: l3NhRx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.send_p2p",
+					Params:     []interface{}{uint32(vport), uint32(_p2pQid(vport))},
+				},
+			},
+			p4client.TableEntry{
+				Tablename: p2pIn,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.set_crypto_ip",
+					Params:     []interface{}{mod_ptr, uint32(nexthop.Metadata["sa_idx"].(uint32)), uint32(vport)},
+				},
+			})
+	} else if nexthop.NhType == netlink_polling.VXLAN_TUN {
+		//
+
+		var innserSmac, _ = net.ParseMAC(nexthop.Metadata["inner_smac"].(string))
+		var innserDmac, _ = net.ParseMAC(nexthop.Metadata["inner_dmac"].(string))
+		var localVTepIP = net.ParseIP(nexthop.Metadata["local_vtep_ip"].(string))
+		var remoteVTepIP = net.ParseIP(nexthop.Metadata["remote_vtep_ip"].(string))
+
+		entries = append(entries, p4client.TableEntry{
+			Tablename: pushVxlanIPSec,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"meta.common.mod_blob_ptr": {mod_ptr, "exact"},
+				},
+				Priority: int32(0),
+			},
+			Action: p4client.Action{
+				ActionName: "evpn_gw_control.omac_crypto_vxlan_imac_push",
+				Params:     []interface{}{phySmac, phyDmac, localTepIP, remoteTepIP, localVTepIP, remoteVTepIP, Vxlan.vxlanUDPPort, uint32(nexthop.Metadata["vni"].(uint32)), innserSmac, innserDmac}, //TODO,
+			},
+		},
+			p4client.TableEntry{
+				Tablename: l3NhTx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Tx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.push_crypto_outermac_vxlan_innermac",
+					Params:     []interface{}{mod_ptr, uint32(vport), uint32(nexthop.Metadata["sa_idx"].(uint32))}, //TODO,
+				},
+			},
+			p4client.TableEntry{
+				Tablename: l3NhRx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.send_p2p",
+					Params:     []interface{}{uint32(vport), uint32(_p2pQid(vport))},
+				},
+			},
+			p4client.TableEntry{
+				Tablename: p2pIn,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.push_crypto_outermac_vxlan_innermac",
+					Params:     []interface{}{mod_ptr, uint32(vport), uint32(nexthop.Metadata["sa_idx"].(uint32))},
+				},
+			})
+	}
+	return entries
+}
+
+func (IPSec IPSecDecoder) translateDeletedNexthop(nexthop netlink_polling.NexthopStruct) []interface{} {
+	var entries = make([]interface{}, 0)
+	if nexthop.NhType != netlink_polling.TUN && nexthop.NhType != netlink_polling.VXLAN_TUN {
+		return entries
+	}
+	key := fmt.Sprintf("%d-%s-%s-%d-%s-%t-%d-%d", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Prefsrc, nexthop.Key.Local, nexthop.Key.Weight, nexthop.Key.NhType)
+	var mod_ptr= ptrPool.ReleaseID(key)
+	// AP: IPSEC fix
+	//var mod_ptr = ptrPool.ReleaseID(EntryType.l3NH, nexthop.Key)
+
+	if nexthop.NhType == netlink_polling.TUN {
+		//
+		entries = append(entries, p4client.TableEntry{
+			Tablename: pushIPSec,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"meta.common.mod_blob_ptr": {mod_ptr, "exact"},
+				},
+				Priority: int32(0),
+			},
+		},
+			p4client.TableEntry{
+				Tablename: l3NhTx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Tx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+			p4client.TableEntry{
+				Tablename: l3NhRx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+			p4client.TableEntry{
+				Tablename: p2pIn,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+		)
+	} else if nexthop.NhType == netlink_polling.VXLAN_TUN {
+
+		entries = append(entries, p4client.TableEntry{
+			Tablename: pushVxlanIPSec,
+			TableField: p4client.TableField{
+				FieldValue: map[string][2]interface{}{
+					"meta.common.mod_blob_ptr": {mod_ptr, "exact"},
+				},
+				Priority: int32(0),
+			},
+		},
+			p4client.TableEntry{
+				Tablename: l3NhTx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Tx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+			p4client.TableEntry{
+				Tablename: l3NhRx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+			p4client.TableEntry{
+				Tablename: p2pIn,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(_p4NexthopID(nexthop, Direction.Rx)), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+		)
+	}
+	return entries
+}
+
+/*func (IPSec IPSecDecoder) SataticAdditions() []interface{} {
+	var entries = make([]interface{}, 0)
+}
+
+func (IPSec IPSecDecoder) SataticDeletions() []interface{} {
+	var entries = make([]interface{}, 0)
+}*/
+
 // VxlanDecoder structure
 type VxlanDecoder struct {
 	vxlanUDPPort uint32
@@ -1861,7 +2591,7 @@ func (v VxlanDecoder) translateAddedVrf(vrf *infradb.Vrf) []interface{} {
 		},
 		Action: p4client.Action{
 			ActionName: "evpn_gw_control.pop_vxlan_set_vrf_id",
-			Params:     []interface{}{ModPointer.ignorePtr, uint32(tcamPrefix), uint32(_toEgressVsi(v._defaultVsi)), *vrf.Metadata.RoutingTable[0]},
+			Params:     []interface{}{ModPointer.ignorePtr, uint32(tcamPrefix), *vrf.Metadata.RoutingTable[0]},
 		},
 	})
 	return entries
@@ -1962,7 +2692,7 @@ func (v VxlanDecoder) translateAddedNexthop(nexthop netlink_polling.NexthopStruc
 	if nexthop.NhType != netlink_polling.VXLAN {
 		return entries
 	}
-	key := fmt.Sprintf("%d-%s-%s-%d-%v", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Local)
+	key := fmt.Sprintf("%d-%s-%s-%d-%s-%t-%d-%d", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Prefsrc, nexthop.Key.Local, nexthop.Key.Weight, nexthop.Key.NhType)
 	var modPtr = ptrPool.GetID(key)
 	var vport = nexthop.Metadata["egress_vport"].(int)
 	var smac, _ = net.ParseMAC(nexthop.Metadata["phy_smac"].(string))
@@ -2038,7 +2768,8 @@ func (v VxlanDecoder) translateDeletedNexthop(nexthop netlink_polling.NexthopStr
 		return entries
 	}
 	// var key []interface{}
-	key := fmt.Sprintf("%d-%s-%s-%d-%v", EntryType.l2Nh, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Local)
+	// AP: FIX
+	key := fmt.Sprintf("%d-%s-%s-%d-%s-%t-%d-%d", EntryType.l3NH, nexthop.Key.VrfName, nexthop.Key.Dst, nexthop.Key.Dev, nexthop.Key.Prefsrc, nexthop.Key.Local, nexthop.Key.Weight, nexthop.Key.NhType)
 	var modPtr = ptrPool.ReleaseID(key)
 	entries = append(entries, p4client.TableEntry{
 		Tablename: pushVxlanHdr,
@@ -2113,7 +2844,7 @@ func (v VxlanDecoder) translateAddedL2Nexthop(nexthop netlink_polling.L2NexthopS
 		},
 	},
 		p4client.TableEntry{
-			Tablename: l2Nh,
+			Tablename: l2NhTx,
 			TableField: p4client.TableField{
 				FieldValue: map[string][2]interface{}{
 					"neighbor":    {uint16(neighbor), "exact"},
@@ -2149,7 +2880,7 @@ func (v VxlanDecoder) translateDeletedL2Nexthop(nexthop netlink_polling.L2Nextho
 		},
 	},
 		p4client.TableEntry{
-			Tablename: l2Nh,
+			Tablename: l2NhTx,
 			TableField: p4client.TableField{
 				FieldValue: map[string][2]interface{}{
 					"neighbor":    {uint16(neighbor), "exact"},
@@ -2247,7 +2978,10 @@ func (p PodDecoder) PodDecoderInit(representors map[string][2]string) PodDecoder
 	p._vrfMuxVsi = int(vrfMuxVsi)
 	p._vrfMuxMac = p.vrfMuxIDs[1]
 	p.floodModPtr = ModPointer.l2FloodingPtr
-	p.floodNhID = uint16(0)
+	//p.floodNhID = uint16(0)
+	//AP:IPSEC
+	p.floodNhID = uint16(1)
+	// end AP:IPSEC
 	return p
 }
 
@@ -2402,7 +3136,7 @@ func (p PodDecoder) translateAddedBp(bp *infradb.BridgePort) ([]interface{}, err
 					},
 					Action: p4client.Action{
 						ActionName: "evpn_gw_control.pop_vlan_set_vrf_id",
-						Params:     []interface{}{ignorePtr, uint32(tcamPrefix), uint32(0), uint16(*VrfObj.Metadata.RoutingTable[0])},
+						Params:     []interface{}{ignorePtr, uint32(tcamPrefix), uint16(*VrfObj.Metadata.RoutingTable[0])},
 					},
 				})
 			} else {
@@ -2813,7 +3547,7 @@ func (p PodDecoder) translateAddedSvi(svi *infradb.Svi) ([]interface{}, error) {
 					},
 					Action: p4client.Action{
 						ActionName: "evpn_gw_control.pop_vlan_set_vrf_id",
-						Params:     []interface{}{ignorePtr, uint32(tcamPrefix), uint32(0), uint16(*VrfObj.Spec.Vni)},
+						Params:     []interface{}{ignorePtr, uint32(tcamPrefix), uint16(*VrfObj.Spec.Vni)},
 					},
 				})
 			}
@@ -2940,7 +3674,7 @@ func (p PodDecoder) translateAddedL2Nexthop(nexthop netlink_polling.L2NexthopStr
 	}
 	if portType == infradb.Access {
 		entries = append(entries, p4client.TableEntry{
-			Tablename: l2Nh,
+			Tablename: l2NhRx,
 			TableField: p4client.TableField{
 				FieldValue: map[string][2]interface{}{
 					"neighbor":    {uint16(neighbor), "exact"},
@@ -2952,10 +3686,24 @@ func (p PodDecoder) translateAddedL2Nexthop(nexthop netlink_polling.L2NexthopStr
 				ActionName: "evpn_gw_control.fwd_to_port",
 				Params:     []interface{}{uint32(_toEgressVsi(portID))},
 			},
-		})
+		},
+			p4client.TableEntry{
+				Tablename: l2NhTx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(neighbor), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.fwd_to_port",
+					Params:     []interface{}{uint32(_toEgressVsi(portID))},
+				},
+			})
 	} else if portType == infradb.Trunk {
 		key := fmt.Sprintf("%d-%s-%d-%s", EntryType.l2Nh, nexthop.Key.Dev, nexthop.Key.VlanID, nexthop.Key.Dst)
-		var modPtr = ptrPool.GetID(key)
+		var modPtr= ptrPool.GetID(key)
 		entries = append(entries, p4client.TableEntry{
 			Tablename: pushVlan,
 			TableField: p4client.TableField{
@@ -2970,7 +3718,21 @@ func (p PodDecoder) translateAddedL2Nexthop(nexthop netlink_polling.L2NexthopStr
 			},
 		},
 			p4client.TableEntry{
-				Tablename: l2Nh,
+				Tablename: l2NhRx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(neighbor), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+				Action: p4client.Action{
+					ActionName: "evpn_gw_control.push_vlan_l2",
+					Params:     []interface{}{modPtr, uint32(_toEgressVsi(portID))},
+				},
+			},
+			p4client.TableEntry{
+				Tablename: l2NhTx,
 				TableField: p4client.TableField{
 					FieldValue: map[string][2]interface{}{
 						"neighbor":    {uint16(neighbor), "exact"},
@@ -3000,7 +3762,7 @@ func (p PodDecoder) translateDeletedL2Nexthop(nexthop netlink_polling.L2NexthopS
 
 	if portType == infradb.Access {
 		entries = append(entries, p4client.TableEntry{
-			Tablename: l2Nh,
+			Tablename: l2NhRx,
 			TableField: p4client.TableField{
 				FieldValue: map[string][2]interface{}{
 					"neighbor":    {uint16(neighbor), "exact"},
@@ -3008,7 +3770,17 @@ func (p PodDecoder) translateDeletedL2Nexthop(nexthop netlink_polling.L2NexthopS
 				},
 				Priority: int32(0),
 			},
-		})
+		},
+			p4client.TableEntry{
+				Tablename: l2NhTx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(neighbor), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			})
 	} else if portType == infradb.Trunk {
 		key := fmt.Sprintf("%d-%s-%d-%s", EntryType.l2Nh, nexthop.Key.Dev, nexthop.Key.VlanID, nexthop.Key.Dst)
 		modPtr = ptrPool.ReleaseID(key)
@@ -3022,7 +3794,17 @@ func (p PodDecoder) translateDeletedL2Nexthop(nexthop netlink_polling.L2NexthopS
 			},
 		},
 			p4client.TableEntry{
-				Tablename: l2Nh,
+				Tablename: l2NhRx,
+				TableField: p4client.TableField{
+					FieldValue: map[string][2]interface{}{
+						"neighbor":    {uint16(neighbor), "exact"},
+						"bit32_zeros": {uint32(0), "exact"},
+					},
+					Priority: int32(0),
+				},
+			},
+			p4client.TableEntry{
+				Tablename: l2NhTx,
 				TableField: p4client.TableField{
 					FieldValue: map[string][2]interface{}{
 						"neighbor":    {uint16(neighbor), "exact"},
@@ -3081,6 +3863,11 @@ func (p PodDecoder) StaticAdditions() []interface{} {
 			},
 		},
 		// NH entry for flooding
+		/* # Static NH entry for punting packets to ACC slow path for flooding
+		# The mod action pushes the ingress VSI and the vlan_id from metadata into the S-VLAN and
+		# C-VLAN tags before sending the packet up to the ACC through the port_mux VSI. Thus, the
+		# packet will be received fronm the right vport representor and with right VLAN tag for
+		# slow path L2 forwarding in the Linux bridge br-tenant.*/
 		p4client.TableEntry{
 			Tablename: pushQnQFlood,
 			TableField: p4client.TableField{
@@ -3095,7 +3882,7 @@ func (p PodDecoder) StaticAdditions() []interface{} {
 			},
 		},
 		p4client.TableEntry{
-			Tablename: l2Nh,
+			Tablename: l2NhTx,
 			TableField: p4client.TableField{
 				FieldValue: map[string][2]interface{}{
 					"neighbor":    {p.floodNhID, "exact"},
@@ -3105,7 +3892,10 @@ func (p PodDecoder) StaticAdditions() []interface{} {
 			},
 			Action: p4client.Action{
 				ActionName: "evpn_gw_control.push_stag_ctag",
-				Params:     []interface{}{p.floodModPtr, uint32(_toEgressVsi(p._vrfMuxVsi))},
+				//Params:     []interface{}{p.floodModPtr, uint32(_toEgressVsi(p._vrfMuxVsi))},
+				//AP:IPSEC
+				Params: []interface{}{p.floodModPtr, uint32(_toEgressVsi(p._portMuxVsi))},
+				// end AP:IPSEC
 			},
 		})
 	return entries
@@ -3155,7 +3945,7 @@ func (p PodDecoder) StaticDeletions() []interface{} {
 			},
 		},
 		p4client.TableEntry{
-			Tablename: l2Nh,
+			Tablename: l2NhTx,
 			TableField: p4client.TableField{
 				FieldValue: map[string][2]interface{}{
 					"neighbor":    {p.floodNhID, "exact"},
