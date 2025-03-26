@@ -4,12 +4,11 @@
 // Copyright (C) 2023 Nordix Foundation.
 
 // Package main is the main package of the application
-//
-//nolint:all
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +26,8 @@ import (
 	"github.com/opiproject/opi-evpn-bridge/pkg/config"
 	"github.com/opiproject/opi-evpn-bridge/pkg/infradb"
 	"github.com/opiproject/opi-evpn-bridge/pkg/infradb/taskmanager"
+	"github.com/opiproject/opi-evpn-bridge/pkg/ipsec"
+	psec "github.com/opiproject/opi-evpn-bridge/pkg/ipsec/gen/go"
 	"github.com/opiproject/opi-evpn-bridge/pkg/port"
 	"github.com/opiproject/opi-evpn-bridge/pkg/svi"
 	"github.com/opiproject/opi-evpn-bridge/pkg/utils"
@@ -41,10 +42,11 @@ import (
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	ci_linux "github.com/opiproject/opi-evpn-bridge/pkg/LinuxCIModule"
 	gen_linux "github.com/opiproject/opi-evpn-bridge/pkg/LinuxGeneralModule"
+	intel_e2000_linux "github.com/opiproject/opi-intel-bridge/pkg/evpn/LinuxVendorModule/intele2000"
 	frr "github.com/opiproject/opi-evpn-bridge/pkg/frr"
 	netlink "github.com/opiproject/opi-evpn-bridge/pkg/netlink"
-	intel_e2000_linux "github.com/opiproject/opi-intel-bridge/pkg/evpn/LinuxVendorModule/intele2000"
 	"github.com/opiproject/opi-intel-bridge/pkg/evpn/vendor_plugins/intel-e2000/p4runtime/p4driverapi"
 	ipu_vendor "github.com/opiproject/opi-intel-bridge/pkg/evpn/vendor_plugins/intel-e2000/p4runtime/p4translation"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -75,6 +77,11 @@ var rootCmd = &cobra.Command{
 			intel_e2000_linux.Initialize()
 			frr.Initialize()
 			ipu_vendor.Initialize()
+
+		case "ci":
+			gen_linux.Initialize()
+			ci_linux.Initialize()
+			frr.Initialize()
 		default:
 			log.Panic(" ERROR: Could not find Build env ")
 		}
@@ -88,6 +95,12 @@ var rootCmd = &cobra.Command{
 			netlink.Initialize()
 		default:
 		}
+
+		// Create GRD tunnel representor configuration during startup
+		if err := createGrdTunnelRep(); err != nil {
+			log.Panicf("Error: %v", err)
+		}
+
 		runGrpcServer(config.GlobalConfig.GRPCPort, config.GlobalConfig.TLSFiles)
 
 	},
@@ -121,7 +134,7 @@ var logger *log.Logger
 func setupLogger(filename string) {
 	var err error
 	filename = filepath.Clean(filename)
-	out, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	out, err := os.OpenFile(filename, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -143,6 +156,10 @@ func cleanUp() {
 		ipu_vendor.DeInitialize()
 		close(p4driverapi.StopCh)
 
+	case "ci":
+		gen_linux.DeInitialize()
+		ci_linux.DeInitialize()
+		frr.DeInitialize()
 	default:
 		log.Panic(" ERROR: Could not find Build env ")
 	}
@@ -159,6 +176,7 @@ func main() {
 
 	// initialize  cobra config
 	if err := initialize(); err != nil {
+		// log.Println(err)
 		log.Panicf("Error in initialize(): %v", err)
 	}
 
@@ -180,6 +198,9 @@ func main() {
 		default:
 			fmt.Println("Received unknown signal.")
 		}
+		// Perform any cleanup tasks here.
+		// ...
+
 		// Exit the program.
 		os.Exit(0)
 	}()
@@ -242,10 +263,12 @@ func runGrpcServer(grpcPort uint16, tlsFiles string) {
 	portServer := port.NewServer()
 	vrfServer := vrf.NewServer()
 	sviServer := svi.NewServer()
+	ipsecServer := ipsec.NewServer()
 	pe.RegisterLogicalBridgeServiceServer(s, bridgeServer)
 	pe.RegisterBridgePortServiceServer(s, portServer)
 	pe.RegisterVrfServiceServer(s, vrfServer)
 	pe.RegisterSviServiceServer(s, sviServer)
+	psec.RegisterIPUIPSecServer(s, ipsecServer)
 	pc.RegisterInventoryServiceServer(s, &inventory.Server{})
 
 	reflection.Register(s)
@@ -299,6 +322,42 @@ func createGrdVrf() error {
 	if err != nil {
 		log.Printf("CreateGrdVrf(): Error in creating GRD VRF object %+v\n", err)
 		return err
+	}
+
+	return nil
+}
+
+// CreateGrdTunnelRep creates the Tunnel Representors interfaces for GRD VRF domain
+func createGrdTunnelRep() error {
+	if !config.GlobalConfig.Ipsec.Enabled {
+		return nil
+	}
+
+	if len(config.GlobalConfig.Ipsec.Tunnels) == 0 {
+		return errors.New("createGrdTunnelRep(): Tunnel configuration is missing from configuration file")
+
+	}
+
+	for _, tunCfg := range config.GlobalConfig.Ipsec.Tunnels {
+		tunRep, err := infradb.NewTunRep(tunCfg)
+		if err != nil {
+			return err
+		}
+
+		_, err = infradb.GetTunRep(tunRep.Name)
+		if err != nil {
+			if err != infradb.ErrKeyNotFound {
+				return err
+			}
+		} else {
+			err = fmt.Errorf("createGrdTunnelRep(): Already existing Tunnel Representor with id %v", tunRep.Name)
+			return err
+		}
+
+		err = infradb.CreateTunRep(tunRep)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
